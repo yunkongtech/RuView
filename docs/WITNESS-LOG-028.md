@@ -35,7 +35,7 @@ git checkout 96b01008
 ### Step 2: Rust Workspace — Full Test Suite
 
 ```bash
-cd rust-port/wifi-densepose-rs
+cd v2
 cargo test --workspace --no-default-features
 ```
 
@@ -89,7 +89,7 @@ ls firmware/esp32-csi-node/build/*.bin 2>/dev/null || echo "App binary in build/
 ### Step 6: Verify ADR-018 Binary Frame Parser
 
 ```bash
-cd rust-port/wifi-densepose-rs
+cd v2
 cargo test -p wifi-densepose-hardware --no-default-features
 ```
 
@@ -133,7 +133,7 @@ cargo test -p wifi-densepose-train --no-default-features
 ### Step 9: Verify Python Proof System
 
 ```bash
-python v1/data/proof/verify.py
+python archive/v1/data/proof/verify.py
 ```
 
 **Expected:** PASS (hash `8c0680d7...` matches `expected_features.sha256`).

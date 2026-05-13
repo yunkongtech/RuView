@@ -25,7 +25,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUST_DIR="${SCRIPT_DIR}/rust-port/wifi-densepose-rs"
+RUST_DIR="${SCRIPT_DIR}/v2"
 
 # ─── Colors ───────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -485,11 +485,13 @@ recommend_profile() {
     echo "  Available profiles based on your system:"
     echo ""
 
-    local idx=1
-    declare -A PROFILE_MAP
+    local idx=0
+    # Use indexed array instead of associative array for Bash 3.2 (macOS) compatibility
+    local profile_names=()
 
     for p in "${available_profiles[@]}"; do
         local marker=""
+        idx=$((idx + 1))
         if [ "$p" == "$recommended" ]; then
             marker=" ${GREEN}(recommended)${RESET}"
         fi
@@ -502,13 +504,13 @@ recommend_profile() {
             iot)     echo -e "    ${BOLD}${idx})${RESET} iot     - ESP32 sensor mesh + aggregator${marker}" ;;
             field)   echo -e "    ${BOLD}${idx})${RESET} field   - WiFi-Mat disaster response kit (~62 MB)${marker}" ;;
         esac
-        PROFILE_MAP[$idx]="$p"
-        idx=$((idx + 1))
+        profile_names+=("$p")
     done
 
     # Always show full as the last option
+    idx=$((idx + 1))
     echo -e "    ${BOLD}${idx})${RESET} full    - Install everything available"
-    PROFILE_MAP[$idx]="full"
+    profile_names+=("full")
 
     if [ -n "$PROFILE" ]; then
         echo ""
@@ -525,8 +527,8 @@ recommend_profile() {
 
     if [ -z "$choice" ]; then
         PROFILE="$recommended"
-    elif [[ -n "${PROFILE_MAP[$choice]+x}" ]]; then
-        PROFILE="${PROFILE_MAP[$choice]}"
+    elif [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "$idx" ]; then
+        PROFILE="${profile_names[$((choice - 1))]}"
     else
         echo -e "  ${RED}Invalid choice. Using ${recommended}.${RESET}"
         PROFILE="$recommended"
@@ -953,7 +955,7 @@ post_install() {
             ;;
         rust)
             echo "    # Run benchmarks:"
-            echo "    cd rust-port/wifi-densepose-rs"
+            echo "    cd v2"
             echo "    cargo bench --package wifi-densepose-signal"
             echo ""
             echo "    # Start Rust API server:"
@@ -961,7 +963,7 @@ post_install() {
             ;;
         browser)
             echo "    # WASM package is at:"
-            echo "    # rust-port/wifi-densepose-rs/crates/wifi-densepose-wasm/pkg/"
+            echo "    # v2/crates/wifi-densepose-wasm/pkg/"
             echo ""
             echo "    # Open the 3D visualization:"
             echo "    python3 -m http.server 3000 --directory ui"
@@ -997,17 +999,17 @@ post_install() {
             echo "    # WiFi-Mat disaster response module built."
             echo ""
             echo "    # Run WiFi-Mat tests:"
-            echo "    cd rust-port/wifi-densepose-rs"
+            echo "    cd v2"
             echo "    cargo test --package wifi-densepose-mat"
             echo ""
             echo "    # Field deployment WASM package at:"
-            echo "    # rust-port/wifi-densepose-rs/crates/wifi-densepose-wasm/pkg/"
+            echo "    # v2/crates/wifi-densepose-wasm/pkg/"
             ;;
         full)
             echo "    # Verification:  ./verify"
             echo "    # Python API:    uvicorn v1.src.api.main:app --host 0.0.0.0 --port 8000"
-            echo "    # Rust API:      cd rust-port/wifi-densepose-rs && cargo run --release --package wifi-densepose-api"
-            echo "    # Benchmarks:    cd rust-port/wifi-densepose-rs && cargo bench"
+            echo "    # Rust API:      cd v2 && cargo run --release --package wifi-densepose-api"
+            echo "    # Benchmarks:    cd v2 && cargo bench"
             echo "    # Visualization: python3 -m http.server 3000 --directory ui"
             echo "    # Docker:        docker compose up"
             ;;

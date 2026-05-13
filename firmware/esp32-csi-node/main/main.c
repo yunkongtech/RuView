@@ -16,6 +16,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_app_desc.h"
 #include "sdkconfig.h"
 
 #include "csi_collector.h"
@@ -26,6 +27,14 @@
 #include "power_mgmt.h"
 #include "wasm_runtime.h"
 #include "wasm_upload.h"
+#include "display_task.h"
+#include "mmwave_sensor.h"
+#include "swarm_bridge.h"
+#include "rv_radio_ops.h"          /* ADR-081 Layer 1 — Radio Abstraction Layer. */
+#include "adaptive_controller.h"   /* ADR-081 Layer 2 — Adaptive controller. */
+#ifdef CONFIG_CSI_MOCK_ENABLED
+#include "mock_csi.h"
+#endif
 
 #include "esp_timer.h"
 
@@ -131,19 +140,55 @@ void app_main(void)
     /* Load runtime config (NVS overrides Kconfig defaults) */
     nvs_config_load(&g_nvs_config);
 
-    ESP_LOGI(TAG, "ESP32-S3 CSI Node (ADR-018) — Node ID: %d", g_nvs_config.node_id);
+    /* Capture node_id IMMEDIATELY — before wifi_init_sta() can corrupt
+     * g_nvs_config. See #232/#375/#390: WiFi driver init clobbers the struct
+     * on some devices, reverting node_id to the Kconfig default of 1. */
+    csi_collector_set_node_id(g_nvs_config.node_id);
 
-    /* Initialize WiFi STA */
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    ESP_LOGI(TAG, "ESP32-S3 CSI Node (ADR-018) — v%s — Node ID: %d",
+             app_desc->version, g_nvs_config.node_id);
+
+    /* Initialize WiFi STA (skip entirely under QEMU mock — no RF hardware) */
+#ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
     wifi_init_sta();
+#else
+    ESP_LOGI(TAG, "Mock CSI mode: skipping WiFi init (CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT)");
+#endif
 
     /* Initialize UDP sender with runtime target */
+#ifdef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
+    ESP_LOGI(TAG, "Mock CSI mode: skipping UDP sender init (no network)");
+#else
     if (stream_sender_init_with(g_nvs_config.target_ip, g_nvs_config.target_port) != 0) {
         ESP_LOGE(TAG, "Failed to initialize UDP sender");
         return;
     }
+#endif
 
     /* Initialize CSI collection */
+#ifdef CONFIG_CSI_MOCK_ENABLED
+    /* ADR-061: Start mock CSI generator (replaces real WiFi CSI in QEMU) */
+    esp_err_t mock_ret = mock_csi_init(CONFIG_CSI_MOCK_SCENARIO);
+    if (mock_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Mock CSI init failed: %s", esp_err_to_name(mock_ret));
+    } else {
+        ESP_LOGI(TAG, "Mock CSI active (scenario=%d)", CONFIG_CSI_MOCK_SCENARIO);
+    }
+#else
     csi_collector_init();
+
+    /* ADR-073: Start multi-frequency channel hopping if configured in NVS. */
+    if (g_nvs_config.channel_hop_count > 1) {
+        ESP_LOGI(TAG, "Starting channel hopping: %u channels, dwell=%lu ms",
+                 (unsigned)g_nvs_config.channel_hop_count,
+                 (unsigned long)g_nvs_config.dwell_ms);
+        csi_collector_set_hop_table(
+            g_nvs_config.channel_list,
+            g_nvs_config.channel_hop_count,
+            g_nvs_config.dwell_ms);
+    }
+#endif
 
     /* ADR-039: Initialize edge processing pipeline. */
     edge_config_t edge_cfg = {
@@ -161,12 +206,17 @@ void app_main(void)
                  esp_err_to_name(edge_ret));
     }
 
-    /* Initialize OTA update HTTP server. */
+    /* Initialize OTA update HTTP server (requires network). */
     httpd_handle_t ota_server = NULL;
+#ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
     esp_err_t ota_ret = ota_update_init_ex(&ota_server);
     if (ota_ret != ESP_OK) {
         ESP_LOGW(TAG, "OTA server init failed: %s", esp_err_to_name(ota_ret));
     }
+#else
+    esp_err_t ota_ret = ESP_ERR_NOT_SUPPORTED;
+    ESP_LOGI(TAG, "Mock CSI mode: skipping OTA server (no network)");
+#endif
 
     /* ADR-040: Initialize WASM programmable sensing runtime. */
     esp_err_t wasm_ret = wasm_runtime_init();
@@ -200,14 +250,85 @@ void app_main(void)
         }
     }
 
+    /* ADR-063: Initialize mmWave sensor (auto-detect on UART). */
+    esp_err_t mmwave_ret = mmwave_sensor_init(-1, -1);  /* -1 = use default GPIO pins */
+    if (mmwave_ret == ESP_OK) {
+        mmwave_state_t mw;
+        if (mmwave_sensor_get_state(&mw)) {
+            ESP_LOGI(TAG, "mmWave sensor: %s (caps=0x%04x)",
+                     mmwave_type_name(mw.type), mw.capabilities);
+        }
+    } else {
+        ESP_LOGI(TAG, "No mmWave sensor detected (CSI-only mode)");
+    }
+
+    /* ADR-066: Initialize swarm bridge to Cognitum Seed (if configured). */
+    esp_err_t swarm_ret = ESP_ERR_INVALID_ARG;
+#ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
+    if (g_nvs_config.seed_url[0] != '\0') {
+        swarm_config_t swarm_cfg = {
+            .heartbeat_sec = g_nvs_config.swarm_heartbeat_sec,
+            .ingest_sec    = g_nvs_config.swarm_ingest_sec,
+            .enabled       = 1,
+        };
+        strncpy(swarm_cfg.seed_url, g_nvs_config.seed_url, sizeof(swarm_cfg.seed_url) - 1);
+        strncpy(swarm_cfg.seed_token, g_nvs_config.seed_token, sizeof(swarm_cfg.seed_token) - 1);
+        strncpy(swarm_cfg.zone_name, g_nvs_config.zone_name, sizeof(swarm_cfg.zone_name) - 1);
+        swarm_ret = swarm_bridge_init(&swarm_cfg, csi_collector_get_node_id());
+        if (swarm_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Swarm bridge init failed: %s", esp_err_to_name(swarm_ret));
+        }
+    } else {
+        ESP_LOGI(TAG, "Swarm bridge disabled (no seed_url configured)");
+    }
+#else
+    ESP_LOGI(TAG, "Mock CSI mode: skipping swarm bridge");
+#endif
+
+    /* ADR-081 Layer 1: register the active radio ops binding.
+     * - Real hardware: ESP32 binding wrapping csi_collector + esp_wifi.
+     * - QEMU / offline: mock binding wrapping mock_csi.c.
+     * Either way, the layers above (adaptive controller, mesh plane,
+     * feature extraction) address the radio through the same vtable —
+     * this is the portability acceptance test in ADR-081. */
+#ifdef CONFIG_CSI_MOCK_ENABLED
+    rv_radio_ops_mock_register();
+#else
+    rv_radio_ops_esp32_register();
+#endif
+    const rv_radio_ops_t *radio_ops = rv_radio_ops_get();
+    if (radio_ops != NULL && radio_ops->init != NULL) {
+        radio_ops->init();
+    }
+
+    /* ADR-081 Layer 2: start the adaptive controller. NULL config → use
+     * Kconfig defaults. Default policy is conservative: no channel
+     * switching, no role change. Operators opt in via menuconfig. */
+    esp_err_t adapt_ret = adaptive_controller_init(NULL);
+    if (adapt_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Adaptive controller init failed: %s",
+                 esp_err_to_name(adapt_ret));
+    }
+
     /* Initialize power management. */
     power_mgmt_init(g_nvs_config.power_duty);
 
-    ESP_LOGI(TAG, "CSI streaming active → %s:%d (edge_tier=%u, OTA=%s, WASM=%s)",
+    /* ADR-045: Start AMOLED display task (gracefully skips if no display). */
+#ifdef CONFIG_DISPLAY_ENABLE
+    esp_err_t disp_ret = display_task_start();
+    if (disp_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Display init returned: %s", esp_err_to_name(disp_ret));
+    }
+#endif
+
+    ESP_LOGI(TAG, "CSI streaming active → %s:%d (edge_tier=%u, OTA=%s, WASM=%s, mmWave=%s, swarm=%s, adapt=%s)",
              g_nvs_config.target_ip, g_nvs_config.target_port,
              g_nvs_config.edge_tier,
              (ota_ret == ESP_OK) ? "ready" : "off",
-             (wasm_ret == ESP_OK) ? "ready" : "off");
+             (wasm_ret == ESP_OK) ? "ready" : "off",
+             (mmwave_ret == ESP_OK) ? "active" : "off",
+             (swarm_ret == ESP_OK) ? g_nvs_config.seed_url : "off",
+             (adapt_ret == ESP_OK) ? "on" : "off");
 
     /* Main loop — keep alive */
     while (1) {

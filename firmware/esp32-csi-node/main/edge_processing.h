@@ -26,7 +26,7 @@
 
 /* ---- Magic numbers ---- */
 #define EDGE_VITALS_MAGIC     0xC5110002  /**< Vitals packet magic. */
-#define EDGE_COMPRESSED_MAGIC 0xC5110003  /**< Compressed frame magic. */
+#define EDGE_COMPRESSED_MAGIC 0xC5110005  /**< Compressed frame magic (was 0xC5110003, reassigned for ADR-069). */
 
 /* ---- Buffer sizes ---- */
 #define EDGE_RING_SLOTS       16    /**< SPSC ring buffer slots (power of 2). */
@@ -41,6 +41,13 @@
 /* ---- Calibration ---- */
 #define EDGE_CALIB_FRAMES     1200  /**< Frames for adaptive calibration (~60s at 20 Hz). */
 #define EDGE_CALIB_SIGMA_MULT 3.0f  /**< Threshold = mean + 3*sigma of ambient. */
+
+/* ---- Fall detection ---- */
+#define EDGE_FALL_COOLDOWN_MS 5000  /**< Minimum ms between fall alerts (debounce). */
+#define EDGE_FALL_CONSEC_MIN  3     /**< Consecutive frames above threshold to trigger. */
+
+/* ---- DSP task tuning ---- */
+#define EDGE_BATCH_LIMIT      4     /**< Max frames per batch before longer yield. */
 
 /* ---- SPSC ring buffer slot ---- */
 typedef struct {
@@ -101,6 +108,49 @@ typedef struct __attribute__((packed)) {
 } edge_vitals_pkt_t;
 
 _Static_assert(sizeof(edge_vitals_pkt_t) == 32, "vitals packet must be 32 bytes");
+
+/* ---- ADR-069: CSI Feature Vector packet (48 bytes, wire format) ---- */
+#define EDGE_FEATURE_MAGIC  0xC5110003  /**< Feature vector packet magic. */
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;          /**< EDGE_FEATURE_MAGIC = 0xC5110003. */
+    uint8_t  node_id;        /**< ESP32 node identifier. */
+    uint8_t  reserved;       /**< Alignment padding. */
+    uint16_t seq;            /**< Sequence number. */
+    int64_t  timestamp_us;   /**< Microseconds since boot. */
+    float    features[8];    /**< 8-dim normalized feature vector. */
+} edge_feature_pkt_t;
+
+_Static_assert(sizeof(edge_feature_pkt_t) == 48, "feature packet must be 48 bytes");
+
+/* ---- ADR-063: Fused vitals packet (48 bytes, wire format) ---- */
+#define EDGE_FUSED_MAGIC  0xC5110004  /**< Fused vitals packet magic. */
+
+typedef struct __attribute__((packed)) {
+    /* First 32 bytes match edge_vitals_pkt_t layout */
+    uint32_t magic;          /**< EDGE_FUSED_MAGIC = 0xC5110004. */
+    uint8_t  node_id;
+    uint8_t  flags;          /**< Bit0=presence, Bit1=fall, Bit2=motion, Bit3=mmwave_present. */
+    uint16_t breathing_rate; /**< Fused BPM * 100 (CSI + mmWave Kalman). */
+    uint32_t heartrate;      /**< Fused BPM * 10000. */
+    int8_t   rssi;
+    uint8_t  n_persons;
+    uint8_t  mmwave_type;    /**< mmwave_type_t enum. */
+    uint8_t  fusion_confidence; /**< 0-100 fusion quality score. */
+    float    motion_energy;
+    float    presence_score;
+    uint32_t timestamp_ms;
+    /* mmWave extension (16 bytes) */
+    float    mmwave_hr_bpm;  /**< Raw mmWave heart rate. */
+    float    mmwave_br_bpm;  /**< Raw mmWave breathing rate. */
+    float    mmwave_distance;/**< Distance to nearest target (cm). */
+    uint8_t  mmwave_targets; /**< Target count from mmWave. */
+    uint8_t  mmwave_confidence; /**< mmWave signal quality 0-100. */
+    uint16_t reserved3;
+    uint32_t reserved4;     /**< Pad to 48 bytes for alignment. */
+} edge_fused_vitals_pkt_t;
+
+_Static_assert(sizeof(edge_fused_vitals_pkt_t) == 48, "fused vitals must be 48 bytes");
 
 /* ---- Edge configuration (from NVS) ---- */
 typedef struct {

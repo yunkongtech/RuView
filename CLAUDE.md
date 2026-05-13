@@ -3,7 +3,7 @@
 ## Project: wifi-densepose
 
 WiFi-based human pose estimation using Channel State Information (CSI).
-Dual codebase: Python v1 (`v1/`) and Rust port (`rust-port/wifi-densepose-rs/`).
+Dual codebase: Python v1 (`v1/`) and Rust port (`v2/`).
 ### Key Rust Crates
 | Crate | Description |
 |-------|-------------|
@@ -22,6 +22,8 @@ Dual codebase: Python v1 (`v1/`) and Rust port (`rust-port/wifi-densepose-rs/`).
 | `wifi-densepose-sensing-server` | Lightweight Axum server for WiFi sensing UI |
 | `wifi-densepose-wifiscan` | Multi-BSSID WiFi scanning (ADR-022) |
 | `wifi-densepose-vitals` | ESP32 CSI-grade vital sign extraction (ADR-021) |
+| `nvsim` | Deterministic NV-diamond magnetometer pipeline simulator (ADR-089) — standalone leaf, WASM-ready |
+| `vendor/rvcsi` (submodule) | **rvCSI** — edge RF sensing runtime (ADR-095/096): 9 crates (`rvcsi-core`/`-dsp`/`-events`/`-adapter-file`/`-adapter-nexmon`/`-ruvector`/`-runtime`/`-node`/`-cli`). Lives in its own repo ([github.com/ruvnet/rvcsi](https://github.com/ruvnet/rvcsi)), vendored here under `vendor/rvcsi`, published to crates.io as `rvcsi-* 0.3.x` and to npm as `@ruv/rvcsi`. Not a `v2/` workspace member — depend on the published crates (or the submodule's `crates/rvcsi-*` paths). Normalized `CsiFrame`/`CsiWindow`/`CsiEvent` schema, validate-before-FFI, reusable DSP, typed confidence-scored events, the napi-c Nexmon shim (real nexmon_csi `.pcap` from a Raspberry Pi 5 / 4 / 3B+ — BCM43455c0), the napi-rs SDK, the `rvcsi` CLI, a Claude Code plugin. |
 
 ### RuvSense Modules (`signal/src/ruvsense/`)
 | Module | Purpose |
@@ -70,26 +72,62 @@ All 5 ruvector crates integrated in workspace:
 - ADR-031: RuView sensing-first RF mode (Proposed)
 - ADR-032: Multistatic mesh security hardening (Proposed)
 
+### Supported Hardware
+
+| Device | Port | Chip | Role | Cost |
+|--------|------|------|------|------|
+| ESP32-S3 (8MB flash) | COM7 | Xtensa dual-core | WiFi CSI sensing node | ~$9 |
+| ESP32-S3 SuperMini (4MB) | — | Xtensa dual-core | WiFi CSI (compact) | ~$6 |
+| ESP32-C6 + Seeed MR60BHA2 | COM4 | RISC-V + 60 GHz FMCW | mmWave HR/BR/presence | ~$15 |
+| HLK-LD2410 | — | 24 GHz FMCW | Presence + distance | ~$3 |
+
+**Not supported:** ESP32 (original), ESP32-C3 — single-core, can't run CSI DSP pipeline.
+
 ### Build & Test Commands (this repo)
 ```bash
 # Rust — full workspace tests (1,031+ tests, ~2 min)
-cd rust-port/wifi-densepose-rs
+cd v2
 cargo test --workspace --no-default-features
 
 # Rust — single crate check (no GPU needed)
 cargo check -p wifi-densepose-train --no-default-features
 
-# Rust — publish crates (dependency order)
-cargo publish -p wifi-densepose-core --no-default-features
-cargo publish -p wifi-densepose-signal --no-default-features
-# ... see crate publishing order below
-
 # Python — deterministic proof verification (SHA-256)
-python v1/data/proof/verify.py
+python archive/v1/data/proof/verify.py
 
 # Python — test suite
-cd v1 && python -m pytest tests/ -x -q
+cd archive/v1 && python -m pytest tests/ -x -q
 ```
+
+### ESP32 Firmware Build (Windows — Python subprocess required)
+```bash
+# Build 8MB firmware (real WiFi CSI mode, no mocks)
+# See CLAUDE.local.md for the full Python subprocess command
+# Key: must strip MSYSTEM env vars for ESP-IDF v5.4 on Git Bash
+
+# Build 4MB firmware
+cp sdkconfig.defaults.4mb sdkconfig.defaults
+# then same build process
+
+# Flash to COM7
+# [python, idf_py, '-p', 'COM7', 'flash']
+
+# Provision WiFi
+python firmware/esp32-csi-node/provision.py --port COM7 \
+  --ssid "YourWiFi" --password "secret" --target-ip 192.168.1.20
+
+# Monitor serial
+python -m serial.tools.miniterm COM7 115200
+```
+
+### Firmware Release Process
+1. Build 8MB from `sdkconfig.defaults.template` (no mock)
+2. Build 4MB from `sdkconfig.defaults.4mb` (no mock)
+3. Save 6 binaries: `esp32-csi-node.bin`, `bootloader.bin`, `partition-table.bin`, `ota_data_initial.bin`, `esp32-csi-node-4mb.bin`, `partition-table-4mb.bin`
+4. Tag: `git tag v0.X.Y-esp32 && git push origin v0.X.Y-esp32`
+5. Release: `gh release create v0.X.Y-esp32 <binaries> --title "..." --notes-file ...`
+6. Verify on real hardware (COM7) before publishing
+7. **CRITICAL:** Always test with real WiFi CSI, not mock mode — mock missed the Kconfig threshold bug
 
 ### Crate Publishing Order
 Crates must be published in dependency order:
@@ -115,12 +153,12 @@ Crates must be published in dependency order:
 
 ```bash
 # 1. Rust tests — must be 1,031+ passed, 0 failed
-cd rust-port/wifi-densepose-rs
+cd v2
 cargo test --workspace --no-default-features
 
 # 2. Python proof — must print VERDICT: PASS
-cd ../..
-python v1/data/proof/verify.py
+cd ..
+python archive/v1/data/proof/verify.py
 
 # 3. Generate witness bundle (includes both above + firmware hashes)
 bash scripts/generate-witness-bundle.sh
@@ -133,8 +171,8 @@ bash VERIFY.sh
 **If the Python proof hash changes** (e.g., numpy/scipy version update):
 ```bash
 # Regenerate the expected hash, then verify it passes
-python v1/data/proof/verify.py --generate-hash
-python v1/data/proof/verify.py
+python archive/v1/data/proof/verify.py --generate-hash
+python archive/v1/data/proof/verify.py
 ```
 
 **Witness bundle contents** (`dist/witness-bundle-ADR028-<sha>.tar.gz`):
@@ -147,9 +185,9 @@ python v1/data/proof/verify.py
 - `VERIFY.sh` — One-command self-verification for recipients
 
 **Key proof artifacts:**
-- `v1/data/proof/verify.py` — Trust Kill Switch: feeds reference signal through production pipeline, hashes output
-- `v1/data/proof/expected_features.sha256` — Published expected hash
-- `v1/data/proof/sample_csi_data.json` — 1,000 synthetic CSI frames (seed=42)
+- `archive/v1/data/proof/verify.py` — Trust Kill Switch: feeds reference signal through production pipeline, hashes output
+- `archive/v1/data/proof/expected_features.sha256` — Published expected hash
+- `archive/v1/data/proof/sample_csi_data.json` — 1,000 synthetic CSI frames (seed=42)
 - `docs/WITNESS-LOG-028.md` — 11-step reproducible verification procedure
 - `docs/adr/ADR-028-esp32-capability-audit.md` — Complete audit record
 
@@ -175,13 +213,13 @@ Active feature branch: `ruvsense-full-implementation` (PR #77)
 - NEVER save to root folder — use the directories below
 - `docs/adr/` — Architecture Decision Records (43 ADRs)
 - `docs/ddd/` — Domain-Driven Design models
-- `rust-port/wifi-densepose-rs/crates/` — Rust workspace crates (15 crates)
-- `rust-port/wifi-densepose-rs/crates/wifi-densepose-signal/src/ruvsense/` — RuvSense multistatic modules (14 files)
-- `rust-port/wifi-densepose-rs/crates/wifi-densepose-ruvector/src/viewpoint/` — Cross-viewpoint fusion (5 files)
-- `rust-port/wifi-densepose-rs/crates/wifi-densepose-hardware/src/esp32/` — ESP32 TDM protocol
+- `v2/crates/` — Rust workspace crates (15 crates)
+- `v2/crates/wifi-densepose-signal/src/ruvsense/` — RuvSense multistatic modules (14 files)
+- `v2/crates/wifi-densepose-ruvector/src/viewpoint/` — Cross-viewpoint fusion (5 files)
+- `v2/crates/wifi-densepose-hardware/src/esp32/` — ESP32 TDM protocol
 - `firmware/esp32-csi-node/main/` — ESP32 C firmware (channel hopping, NVS config, TDM)
-- `v1/src/` — Python source (core, hardware, services, api)
-- `v1/data/proof/` — Deterministic CSI proof bundles
+- `archive/v1/src/` — Python source (core, hardware, services, api)
+- `archive/v1/data/proof/` — Deterministic CSI proof bundles
 - `.claude-flow/` — Claude Flow coordination state (committed for team sharing)
 - `.claude/` — Claude Code settings, agents, memory (committed for team sharing)
 
@@ -207,7 +245,7 @@ Active feature branch: `ruvsense-full-implementation` (PR #77)
 Before merging any PR, verify each item applies and is addressed:
 
 1. **Rust tests pass** — `cargo test --workspace --no-default-features` (1,031+ passed, 0 failed)
-2. **Python proof passes** — `python v1/data/proof/verify.py` (VERDICT: PASS)
+2. **Python proof passes** — `python archive/v1/data/proof/verify.py` (VERDICT: PASS)
 3. **README.md** — Update platform tables, crate descriptions, hardware tables, feature summaries if scope changed
 4. **CLAUDE.md** — Update crate table, ADR list, module tables, version if scope changed
 5. **CHANGELOG.md** — Add entry under `[Unreleased]` with what was added/fixed/changed
